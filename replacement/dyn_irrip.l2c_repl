@@ -1,0 +1,288 @@
+#include "cache.h"
+#include <cstdlib>
+
+#define maxRRPV 3
+
+#define INSTR_INSERT_RRPV 0
+#define DATA_INSERT_RRPV  2
+#define INSTR_HIT_RRPV    0
+#define DATA_HIT_RRPV     1
+#define DEFAULT_INSTR_CAP 6
+
+#define DEFAULT_THRESHOLD   0.25
+#define DEFAULT_LEADERS     32
+#define DEFAULT_EPOCH       4096
+#define DEFAULT_MISS_WEIGHT 1
+
+static uint8_t l2_rrpv[NUM_CPUS][L2C_SET][L2C_WAY];
+static uint8_t l2_isinstr[NUM_CPUS][L2C_SET][L2C_WAY];
+
+static double threshold = DEFAULT_THRESHOLD;
+static int num_leaders = DEFAULT_LEADERS;
+static int leader_stride = L2C_SET / DEFAULT_LEADERS;
+static int epoch_len = DEFAULT_EPOCH;
+static int miss_weight = DEFAULT_MISS_WEIGHT;
+static int irrip_cap = DEFAULT_INSTR_CAP;
+
+struct Monitor
+{
+    uint64_t acc[2], miss[2];
+    uint64_t events;
+    bool use_irrip;
+    uint64_t epochs, epochs_irrip;
+    double last_share;
+};
+
+static Monitor mon[NUM_CPUS];
+
+static uint64_t st_fill[2], st_hit[2], st_evict[2];
+static uint64_t st_fill_irrip_mode, st_fill_rrip_mode;
+
+static int env_int(const char *name, int def)
+{
+    const char *s = getenv(name);
+    return (s && *s) ? atoi(s) : def;
+}
+
+static inline bool is_leader(uint32_t set)
+{
+    return (set % leader_stride) == ((set / leader_stride) % leader_stride);
+}
+
+static int instr_lines(uint32_t cpu, uint32_t set, const BLOCK *blk, int skip_way)
+{
+    int n = 0;
+    for (int w = 0; w < L2C_WAY; w++)
+        if (w != skip_way && blk[w].valid && l2_isinstr[cpu][set][w])
+            n++;
+    return n;
+}
+
+static void monitor_event(uint32_t cpu, uint8_t instr, uint8_t hit)
+{
+    Monitor &m = mon[cpu];
+
+    m.acc[instr]++;
+    if (!hit)
+        m.miss[instr]++;
+
+    if (++m.events < (uint64_t)epoch_len)
+        return;
+
+    double instr_w = (double)m.acc[1] + (double)miss_weight * (double)m.miss[1];
+    double total_w = (double)(m.acc[0] + m.acc[1]) +
+                     (double)miss_weight * (double)(m.miss[0] + m.miss[1]);
+    double share = (total_w > 0) ? instr_w / total_w : 0.0;
+
+    m.use_irrip = (share > threshold);
+    m.last_share = share;
+    m.epochs++;
+
+    if (m.use_irrip)
+        m.epochs_irrip++;
+
+    for (int k = 0; k < 2; k++) {
+        m.acc[k] >>= 1;
+        m.miss[k] >>= 1;
+    }
+
+    m.events = 0;
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    const char *t = getenv("DIRRIP_THRESHOLD");
+    if (t && *t)
+        threshold = atof(t);
+
+    int l = env_int("DIRRIP_LEADERS", DEFAULT_LEADERS);
+    if (l < 2)
+        l = 2;
+    if (l > L2C_SET / 2)
+        l = L2C_SET / 2;
+
+    int p = 1;
+    while (p * 2 <= l)
+        p *= 2;
+
+    num_leaders = p;
+    leader_stride = L2C_SET / num_leaders;
+
+    epoch_len = env_int("DIRRIP_EPOCH", DEFAULT_EPOCH);
+    if (epoch_len < 1)
+        epoch_len = 1;
+
+    miss_weight = env_int("DIRRIP_MISS_WEIGHT", DEFAULT_MISS_WEIGHT);
+    if (miss_weight < 0)
+        miss_weight = 0;
+
+    irrip_cap = env_int("IRRIP_CAP", DEFAULT_INSTR_CAP);
+    if (irrip_cap < 0)
+        irrip_cap = 0;
+    if (irrip_cap > L2C_WAY)
+        irrip_cap = L2C_WAY;
+
+    cout << "Initialize Dynamic I-RRIP state for L2C (threshold=" << threshold
+         << ", leader sets=" << num_leaders << ", epoch=" << epoch_len
+         << " events, miss weight=" << miss_weight
+         << ", instruction cap=" << irrip_cap << ")" << endl;
+
+    for (int c = 0; c < NUM_CPUS; c++) {
+        for (int i = 0; i < L2C_SET; i++)
+            for (int j = 0; j < L2C_WAY; j++) {
+                l2_rrpv[c][i][j] = maxRRPV;
+                l2_isinstr[c][i][j] = 0;
+            }
+
+        mon[c] = Monitor();
+        mon[c].acc[0] = mon[c].acc[1] = 0;
+        mon[c].miss[0] = mon[c].miss[1] = 0;
+        mon[c].events = mon[c].epochs = mon[c].epochs_irrip = 0;
+        mon[c].use_irrip = false;
+        mon[c].last_share = 0.0;
+    }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                                const BLOCK *current_set, uint64_t ip,
+                                uint64_t full_addr, uint32_t type)
+{
+    bool irrip = mon[cpu].use_irrip && !is_leader(set);
+
+    while (1) {
+        int data_way = -1, instr_way = -1;
+
+        for (int w = 0; w < L2C_WAY; w++) {
+            if (l2_rrpv[cpu][set][w] != maxRRPV)
+                continue;
+
+            if (l2_isinstr[cpu][set][w]) {
+                if (instr_way < 0)
+                    instr_way = w;
+            } else {
+                if (data_way < 0)
+                    data_way = w;
+            }
+        }
+
+        int victim = -1;
+
+        if (data_way >= 0 && instr_way >= 0) {
+            if (irrip)
+                victim = (instr_lines(cpu, set, current_set, -1) > irrip_cap)
+                             ? instr_way
+                             : data_way;
+            else
+                victim = (data_way < instr_way) ? data_way : instr_way;
+        } else if (data_way >= 0) {
+            victim = data_way;
+        } else if (instr_way >= 0) {
+            victim = instr_way;
+        }
+
+        if (victim >= 0)
+            return victim;
+
+        for (int w = 0; w < L2C_WAY; w++)
+            l2_rrpv[cpu][set][w]++;
+    }
+
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set,
+                                         uint32_t way, uint64_t full_addr,
+                                         uint64_t ip, uint64_t victim_addr,
+                                         uint32_t type, uint8_t hit,
+                                         uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    uint8_t instr = isInstruction ? 1 : 0;
+    bool leader = is_leader(set);
+
+    if (leader && type != WRITEBACK)
+        monitor_event(cpu, instr, hit);
+
+    bool irrip = mon[cpu].use_irrip && !leader;
+
+    if (hit) {
+        if (instr)
+            l2_isinstr[cpu][set][way] = 1;
+
+        uint8_t line_is_instr = l2_isinstr[cpu][set][way];
+
+        if (irrip) {
+            if (line_is_instr)
+                l2_rrpv[cpu][set][way] = INSTR_HIT_RRPV;
+            else if (l2_rrpv[cpu][set][way] > DATA_HIT_RRPV)
+                l2_rrpv[cpu][set][way] = DATA_HIT_RRPV;
+        } else {
+            l2_rrpv[cpu][set][way] = 0;
+        }
+
+        if (warmup_complete[cpu])
+            st_hit[line_is_instr]++;
+    } else {
+        if (warmup_complete[cpu]) {
+            if (block[set][way].valid)
+                st_evict[l2_isinstr[cpu][set][way]]++;
+
+            st_fill[instr]++;
+
+            if (!leader) {
+                if (irrip)
+                    st_fill_irrip_mode++;
+                else
+                    st_fill_rrip_mode++;
+            }
+        }
+
+        uint8_t rrpv = maxRRPV - 1;
+
+        if (irrip) {
+            if (instr && instr_lines(cpu, set, block[set], way) < irrip_cap)
+                rrpv = INSTR_INSERT_RRPV;
+            else
+                rrpv = DATA_INSERT_RRPV;
+        }
+
+        l2_isinstr[cpu][set][way] = instr;
+        l2_rrpv[cpu][set][way] = rrpv;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    const Monitor &m = mon[0];
+    double pct = m.epochs
+                     ? 100.0 * (double)m.epochs_irrip / (double)m.epochs
+                     : 0.0;
+
+    cout << endl;
+    cout << "L2C DYN-IRRIP threshold: " << threshold
+         << "  leader sets: " << num_leaders
+         << "  epoch: " << epoch_len
+         << "  miss weight: " << miss_weight
+         << "  instruction cap: " << irrip_cap << endl;
+
+    cout << "L2C DYN-IRRIP DECISIONS: " << m.epochs
+         << "  chose I-RRIP: " << m.epochs_irrip
+         << " (" << pct << " %)  last instruction share: "
+         << m.last_share << endl;
+
+    cout << "L2C DYN-IRRIP FOLLOWER FILLS in I-RRIP mode: "
+         << st_fill_irrip_mode
+         << "  in RRIP mode: " << st_fill_rrip_mode << endl;
+
+    cout << "L2C DYN-IRRIP FILLS      instruction: " << st_fill[1]
+         << "  data: " << st_fill[0] << endl;
+
+    cout << "L2C DYN-IRRIP HITS       instruction: " << st_hit[1]
+         << "  data: " << st_hit[0] << endl;
+
+    cout << "L2C DYN-IRRIP EVICTIONS  instruction: " << st_evict[1]
+         << "  data: " << st_evict[0] << endl;
+}
