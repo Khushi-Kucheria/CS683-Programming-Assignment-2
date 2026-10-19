@@ -1,6 +1,64 @@
 #include "cache.h"
 #include <cstdlib>
 
+/*
+ * =====================================================================
+ *  Task 3: Prefetch-aware Dynamic I-RRIP for the L2C
+ * =====================================================================
+ *
+ *  Builds on the Task 2b set-dueling Dynamic I-RRIP. Everything from 2b
+ *  (leader sets, instruction-share monitor, instruction cap, I-RRIP
+ *  insertion/promotion/eviction) is unchanged. On top of it, the policy
+ *  now knows which L2 lines were brought in by the L1D SPP prefetcher
+ *  (packet type == PREFETCH) and treats them differently:
+ *
+ *  1. TRACKING   - one extra bit per line (l2_ispf) marks "filled by a
+ *                  prefetch and not yet touched by a demand access".
+ *
+ *  2. INSERTION  - prefetch fills are inserted at an RRPV chosen by an
+ *                  L2-side usefulness monitor:
+ *                    accuracy >= PF_ACC_THRESHOLD -> maxRRPV-1 (like data)
+ *                    accuracy <  PF_ACC_THRESHOLD -> maxRRPV   (evict first)
+ *                  Most SPP prefetches are FILL_L1, so the demand use is
+ *                  served by the L1D and the L2 copy is often dead. Inserting
+ *                  them at distant RRPV keeps them from pushing out
+ *                  instruction lines (which I-RRIP is trying to protect)
+ *                  and reused data lines.
+ *
+ *  3. PROMOTION  - a PREFETCH request that hits an existing line does NOT
+ *                  promote it: a prefetch says nothing about future demand
+ *                  reuse (PACMan-style). The first DEMAND hit on a
+ *                  prefetched line clears its bit, counts it as useful,
+ *                  and promotes it only to PF_PROMOTE_RRPV (default 1)
+ *                  because its next uses will mostly hit in L1D. Further
+ *                  demand hits follow normal Dyn I-RRIP promotion.
+ *
+ *  4. EVICTION   - among lines at maxRRPV, an unused prefetched line is
+ *                  evicted first, then data, then instruction lines (with
+ *                  the 2b instruction-cap rule). Invalid ways are always
+ *                  used before anything else.
+ *
+ *  5. MONITOR    - prefetch fills/hits are excluded from the leader-set
+ *                  instruction-share monitor so the I-RRIP vs RRIP decision
+ *                  reflects demand behaviour only. Without this, a busy
+ *                  prefetcher inflates the "data" side of the formula and
+ *                  wrongly pushes the cache into plain RRIP mode.
+ *
+ *  Leader sets stay pure RRIP (as Task 2b requires) so set dueling is
+ *  still a fair comparison; prefetch awareness applies to follower sets.
+ *
+ *  With no prefetcher configured, no PREFETCH packets reach the L2 and the
+ *  policy behaves exactly like Task 2b.
+ *
+ *  Tunables (environment variables, all optional):
+ *    DIRRIP_THRESHOLD, DIRRIP_LEADERS, DIRRIP_EPOCH, DIRRIP_MISS_WEIGHT,
+ *    IRRIP_CAP                         (from Task 2b)
+ *    PF_ACC_THRESHOLD  (default 0.40)  accuracy needed for near insertion
+ *    PF_EPOCH          (default 512)   resolved prefetches per decision
+ *    PF_PROMOTE_RRPV   (default 1)     RRPV on first demand hit of a pf line
+ * =====================================================================
+ */
+
 #define maxRRPV 3
 
 #define INSTR_INSERT_RRPV 0
@@ -14,9 +72,17 @@
 #define DEFAULT_EPOCH       4096
 #define DEFAULT_MISS_WEIGHT 1
 
-static uint8_t l2_rrpv[NUM_CPUS][L2C_SET][L2C_WAY];
-static uint8_t l2_isinstr[NUM_CPUS][L2C_SET][L2C_WAY];
+// ---- Task 3 defaults ----
+#define DEFAULT_PF_ACC_THRESHOLD 0.40
+#define DEFAULT_PF_EPOCH         512
+#define DEFAULT_PF_PROMOTE_RRPV  1
 
+// Per-line replacement metadata
+static uint8_t l2_rrpv[NUM_CPUS][L2C_SET][L2C_WAY];    // 2 bits used
+static uint8_t l2_isinstr[NUM_CPUS][L2C_SET][L2C_WAY]; // 1 bit: instruction line
+static uint8_t l2_ispf[NUM_CPUS][L2C_SET][L2C_WAY];    // 1 bit: prefetched, not yet demanded
+
+// Task 2b parameters
 static double threshold = DEFAULT_THRESHOLD;
 static int num_leaders = DEFAULT_LEADERS;
 static int leader_stride = L2C_SET / DEFAULT_LEADERS;
@@ -24,6 +90,12 @@ static int epoch_len = DEFAULT_EPOCH;
 static int miss_weight = DEFAULT_MISS_WEIGHT;
 static int irrip_cap = DEFAULT_INSTR_CAP;
 
+// Task 3 parameters
+static double pf_acc_threshold = DEFAULT_PF_ACC_THRESHOLD;
+static int pf_epoch = DEFAULT_PF_EPOCH;
+static int pf_promote_rrpv = DEFAULT_PF_PROMOTE_RRPV;
+
+// Set-dueling monitor (Task 2b), fed by DEMAND accesses to leader sets only
 struct Monitor
 {
     uint64_t acc[2], miss[2];
@@ -35,8 +107,25 @@ struct Monitor
 
 static Monitor mon[NUM_CPUS];
 
+// Prefetch usefulness monitor (Task 3).
+// A prefetched line is "resolved" either when a demand access first hits it
+// (useful) or when it is evicted without ever being demanded (useless).
+struct PfMonitor
+{
+    uint64_t useful, useless; // decayed counts used for the accuracy estimate
+    uint64_t events;          // resolutions in the current epoch
+    uint8_t insert_rrpv;      // current insertion RRPV for prefetch fills
+    uint64_t epochs, epochs_near;
+    double last_acc;
+};
+
+static PfMonitor pfm[NUM_CPUS];
+
+// Statistics (counted after warmup)
 static uint64_t st_fill[2], st_hit[2], st_evict[2];
 static uint64_t st_fill_irrip_mode, st_fill_rrip_mode;
+static uint64_t st_pf_fill, st_pf_useful, st_pf_useless;
+static uint64_t st_pf_hit_by_pf, st_pf_victim;
 
 static int env_int(const char *name, int def)
 {
@@ -58,6 +147,7 @@ static int instr_lines(uint32_t cpu, uint32_t set, const BLOCK *blk, int skip_wa
     return n;
 }
 
+// Task 2b instruction-share monitor (unchanged; now only sees demand events)
 static void monitor_event(uint32_t cpu, uint8_t instr, uint8_t hit)
 {
     Monitor &m = mon[cpu];
@@ -87,6 +177,37 @@ static void monitor_event(uint32_t cpu, uint8_t instr, uint8_t hit)
     }
 
     m.events = 0;
+}
+
+// Task 3: record the outcome of one prefetched line and, once per epoch,
+// re-decide where future prefetch fills are inserted.
+static void pf_resolve(uint32_t cpu, bool useful)
+{
+    PfMonitor &p = pfm[cpu];
+
+    if (useful)
+        p.useful++;
+    else
+        p.useless++;
+
+    if (++p.events < (uint64_t)pf_epoch)
+        return;
+
+    uint64_t total = p.useful + p.useless;
+    double acc = total ? (double)p.useful / (double)total : 0.0;
+
+    // Accurate at L2 -> insert like a normal data line; otherwise insert at
+    // the eviction position so a wrong prefetch costs at most one way briefly.
+    p.insert_rrpv = (acc >= pf_acc_threshold) ? (maxRRPV - 1) : maxRRPV;
+    p.last_acc = acc;
+    p.epochs++;
+    if (p.insert_rrpv == maxRRPV - 1)
+        p.epochs_near++;
+
+    // Halve history so the estimate follows program phases
+    p.useful >>= 1;
+    p.useless >>= 1;
+    p.events = 0;
 }
 
 void CACHE::l2c_initialize_replacement()
@@ -122,16 +243,35 @@ void CACHE::l2c_initialize_replacement()
     if (irrip_cap > L2C_WAY)
         irrip_cap = L2C_WAY;
 
-    cout << "Initialize Dynamic I-RRIP state for L2C (threshold=" << threshold
+    // ---- Task 3 parameters ----
+    const char *pt = getenv("PF_ACC_THRESHOLD");
+    if (pt && *pt)
+        pf_acc_threshold = atof(pt);
+
+    pf_epoch = env_int("PF_EPOCH", DEFAULT_PF_EPOCH);
+    if (pf_epoch < 1)
+        pf_epoch = 1;
+
+    pf_promote_rrpv = env_int("PF_PROMOTE_RRPV", DEFAULT_PF_PROMOTE_RRPV);
+    if (pf_promote_rrpv < 0)
+        pf_promote_rrpv = 0;
+    if (pf_promote_rrpv > maxRRPV)
+        pf_promote_rrpv = maxRRPV;
+
+    cout << "Initialize Prefetch-aware Dynamic I-RRIP state for L2C (threshold=" << threshold
          << ", leader sets=" << num_leaders << ", epoch=" << epoch_len
          << " events, miss weight=" << miss_weight
-         << ", instruction cap=" << irrip_cap << ")" << endl;
+         << ", instruction cap=" << irrip_cap
+         << ", pf acc threshold=" << pf_acc_threshold
+         << ", pf epoch=" << pf_epoch
+         << ", pf promote rrpv=" << pf_promote_rrpv << ")" << endl;
 
     for (int c = 0; c < NUM_CPUS; c++) {
         for (int i = 0; i < L2C_SET; i++)
             for (int j = 0; j < L2C_WAY; j++) {
                 l2_rrpv[c][i][j] = maxRRPV;
                 l2_isinstr[c][i][j] = 0;
+                l2_ispf[c][i][j] = 0;
             }
 
         mon[c] = Monitor();
@@ -140,6 +280,12 @@ void CACHE::l2c_initialize_replacement()
         mon[c].events = mon[c].epochs = mon[c].epochs_irrip = 0;
         mon[c].use_irrip = false;
         mon[c].last_share = 0.0;
+
+        pfm[c] = PfMonitor();
+        pfm[c].useful = pfm[c].useless = pfm[c].events = 0;
+        pfm[c].epochs = pfm[c].epochs_near = 0;
+        pfm[c].insert_rrpv = maxRRPV - 1; // start optimistic (same as RRIP)
+        pfm[c].last_acc = 0.0;
     }
 }
 
@@ -147,16 +293,27 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
                                 const BLOCK *current_set, uint64_t ip,
                                 uint64_t full_addr, uint32_t type)
 {
-    bool irrip = mon[cpu].use_irrip && !is_leader(set);
+    bool leader = is_leader(set);
+    bool irrip = mon[cpu].use_irrip && !leader;
+    bool pf_aware = !leader; // leader sets remain plain RRIP
+
+    // Always fill an empty way first
+    for (int w = 0; w < L2C_WAY; w++)
+        if (!current_set[w].valid)
+            return w;
 
     while (1) {
-        int data_way = -1, instr_way = -1;
+        int pf_way = -1, data_way = -1, instr_way = -1;
 
         for (int w = 0; w < L2C_WAY; w++) {
             if (l2_rrpv[cpu][set][w] != maxRRPV)
                 continue;
 
-            if (l2_isinstr[cpu][set][w]) {
+            if (pf_aware && l2_ispf[cpu][set][w]) {
+                // Prefetched but never demanded: cheapest line to lose
+                if (pf_way < 0)
+                    pf_way = w;
+            } else if (l2_isinstr[cpu][set][w]) {
                 if (instr_way < 0)
                     instr_way = w;
             } else {
@@ -165,6 +322,14 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
             }
         }
 
+        // Priority 1: unused prefetched line
+        if (pf_way >= 0) {
+            if (warmup_complete[cpu])
+                st_pf_victim++;
+            return pf_way;
+        }
+
+        // Priority 2/3: Task 2b data-vs-instruction choice (unchanged)
         int victim = -1;
 
         if (data_way >= 0 && instr_way >= 0) {
@@ -201,14 +366,53 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set,
         assert(0);
 
     uint8_t instr = isInstruction ? 1 : 0;
+    bool is_pf = (type == PREFETCH);
     bool leader = is_leader(set);
 
-    if (leader && type != WRITEBACK)
+    // Set-dueling monitor learns from demand traffic only (no writebacks,
+    // no prefetches), so prefetch volume cannot skew the I-RRIP decision.
+    if (leader && type != WRITEBACK && !is_pf)
         monitor_event(cpu, instr, hit);
 
     bool irrip = mon[cpu].use_irrip && !leader;
 
     if (hit) {
+        // ---------------- Hit by a prefetch request ----------------
+        // A prefetch hitting a resident line predicts nothing about demand
+        // reuse, so follower sets leave its RRPV alone. Leader sets keep
+        // plain RRIP behaviour (promote on any hit).
+        if (is_pf) {
+            if (warmup_complete[cpu])
+                st_pf_hit_by_pf++;
+            if (!leader)
+                return;
+            l2_rrpv[cpu][set][way] = 0;
+            return;
+        }
+
+        // ---------------- First demand hit on a prefetched line ----------------
+        if (l2_ispf[cpu][set][way]) {
+            l2_ispf[cpu][set][way] = 0;
+
+            if (type != WRITEBACK) {
+                pf_resolve(cpu, true);
+                if (warmup_complete[cpu])
+                    st_pf_useful++;
+
+                if (!leader) {
+                    // Moderate promotion: the line has proven useful once, but
+                    // its following uses will mostly be served by the L1D.
+                    if (l2_rrpv[cpu][set][way] > pf_promote_rrpv)
+                        l2_rrpv[cpu][set][way] = pf_promote_rrpv;
+                    if (warmup_complete[cpu])
+                        st_hit[l2_isinstr[cpu][set][way]]++;
+                    return;
+                }
+            }
+            // Writeback hits and leader sets fall through to normal handling.
+        }
+
+        // ---------------- Normal demand / writeback hit (Task 2b) ----------------
         if (instr)
             l2_isinstr[cpu][set][way] = 1;
 
@@ -226,11 +430,22 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set,
         if (warmup_complete[cpu])
             st_hit[line_is_instr]++;
     } else {
+        // ---------------- Fill (miss) ----------------
+        // The victim's metadata is still in place here: if it was a
+        // prefetched line that was never demanded, the prefetch was useless.
+        if (block[set][way].valid && l2_ispf[cpu][set][way]) {
+            pf_resolve(cpu, false);
+            if (warmup_complete[cpu])
+                st_pf_useless++;
+        }
+
         if (warmup_complete[cpu]) {
             if (block[set][way].valid)
                 st_evict[l2_isinstr[cpu][set][way]]++;
 
             st_fill[instr]++;
+            if (is_pf)
+                st_pf_fill++;
 
             if (!leader) {
                 if (irrip)
@@ -242,7 +457,10 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set,
 
         uint8_t rrpv = maxRRPV - 1;
 
-        if (irrip) {
+        if (is_pf && !leader) {
+            // Prefetch fill: insertion depth decided by the usefulness monitor
+            rrpv = pfm[cpu].insert_rrpv;
+        } else if (irrip) {
             if (instr && instr_lines(cpu, set, block[set], way) < irrip_cap)
                 rrpv = INSTR_INSERT_RRPV;
             else
@@ -250,6 +468,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set,
         }
 
         l2_isinstr[cpu][set][way] = instr;
+        l2_ispf[cpu][set][way] = is_pf ? 1 : 0;
         l2_rrpv[cpu][set][way] = rrpv;
     }
 }
@@ -285,4 +504,29 @@ void CACHE::l2c_replacement_final_stats()
 
     cout << "L2C DYN-IRRIP EVICTIONS  instruction: " << st_evict[1]
          << "  data: " << st_evict[0] << endl;
+
+    // ---- Task 3 prefetch-awareness stats ----
+    const PfMonitor &p = pfm[0];
+    double near_pct = p.epochs
+                          ? 100.0 * (double)p.epochs_near / (double)p.epochs
+                          : 0.0;
+    uint64_t resolved = st_pf_useful + st_pf_useless;
+    double l2_pf_acc = resolved ? 100.0 * (double)st_pf_useful / (double)resolved : 0.0;
+
+    cout << "L2C PF-AWARE pf acc threshold: " << pf_acc_threshold
+         << "  pf epoch: " << pf_epoch
+         << "  pf promote rrpv: " << pf_promote_rrpv << endl;
+
+    cout << "L2C PF-AWARE PREFETCH FILLS: " << st_pf_fill
+         << "  demanded (useful): " << st_pf_useful
+         << "  evicted unused: " << st_pf_useless
+         << "  L2-level usefulness: " << l2_pf_acc << " %" << endl;
+
+    cout << "L2C PF-AWARE prefetch hits (no promotion): " << st_pf_hit_by_pf
+         << "  unused-prefetch victims: " << st_pf_victim << endl;
+
+    cout << "L2C PF-AWARE INSERTION DECISIONS: " << p.epochs
+         << "  near (maxRRPV-1): " << p.epochs_near
+         << " (" << near_pct << " %)  last L2 pf accuracy: "
+         << p.last_acc << endl;
 }
